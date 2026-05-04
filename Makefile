@@ -10,4 +10,4 @@ worker: worker.cpp
 	$(CXX) $(CXXFLAGS) -o worker worker.cpp
 
 clean:
-	rm -f oss worker *.o *.log
+	rm -f oss worker *.o *.log logfile.txt

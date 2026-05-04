@@ -1,58 +1,19 @@
 #include <iostream>
 #include <fstream>
-#include <queue>
-#include <string>
-#include <sstream>
-#include <iomanip>
 #include <cstdlib>
-#include <cstdio>
 #include <cstring>
+#include <csignal>
 #include <unistd.h>
-#include <signal.h>
 #include <sys/ipc.h>
-#include <sys/shm.h>
 #include <sys/msg.h>
 #include <sys/wait.h>
 
 using namespace std;
 
-const int MAX_TOTAL_PROCESSES = 20;
-const int PCB_SIZE = 18;
+const int MAX_PROCESSES = 20;
 const int PAGE_SIZE = 1024;
 const int NUM_PAGES = 16;
 const int NUM_FRAMES = 64;
-const unsigned int BILLION = 1000000000;
-const unsigned int CLOCK_INCREMENT = 10000000;
-const unsigned int IDLE_INCREMENT = 100000;
-const unsigned int DISPATCH_OVERHEAD = 1000;
-const int MAX_LOG_LINES = 10000;
-
-struct SimClock {
-    unsigned int seconds;
-    unsigned int nanoseconds;
-};
-
-struct PageTableEntry {
-    int frame;
-    int valid;
-};
-
-struct Frame {
-    int occupied;
-    int dirtyBit;
-    int processIndex;
-    int pageNumber;
-};
-
-struct PCB {
-    int occupied;
-    pid_t pid;
-    int localPid;
-    unsigned int startSeconds;
-    unsigned int startNano;
-    int blocked;
-    PageTableEntry pageTable[NUM_PAGES];
-};
 
 struct Message {
     long mtype;
@@ -62,167 +23,78 @@ struct Message {
     int terminate;
 };
 
-int shmId = -1;
+struct PageTableEntry {
+    int frame;
+};
+
+struct PCB {
+    int occupied;
+    pid_t pid;
+    PageTableEntry pageTable[NUM_PAGES];
+};
+
+struct Frame {
+    int occupied;
+    int process;
+    int page;
+    int dirty;
+};
+
+struct SimClock {
+    unsigned int seconds;
+    unsigned int nanoseconds;
+};
+
 int msgId = -1;
-SimClock* simClock = nullptr;
-
-PCB processTable[PCB_SIZE];
-Frame frameTable[NUM_FRAMES];
-queue<int> readyQueue;
-
-int totalChildren = 5;
-int maxSimultaneous = 2;
-double timeLimitForChildren = 3.0;
-double launchInterval = 0.5;
-string logFileName = "oss.log";
-
-ofstream logFile;
-int logLines = 0;
-
-int launchedTotal = 0;
-int finishedTotal = 0;
-int runningNow = 0;
-
-unsigned int nextLaunchSec = 0;
-unsigned int nextLaunchNano = 0;
-
-unsigned long long totalReads = 0;
-unsigned long long totalWrites = 0;
-unsigned long long totalRequests = 0;
-unsigned long long totalPageFaults = 0;
-
-void writeLog(const string& text) {
-    cout << text;
-
-    if (logLines < MAX_LOG_LINES) {
-        logFile << text;
-        logLines++;
-    }
-}
-
-void addToTime(unsigned int& sec, unsigned int& nano, unsigned int addNano) {
-    nano += addNano;
-
-    while (nano >= BILLION) {
-        nano -= BILLION;
-        sec++;
-    }
-}
-
-void advanceClock(unsigned int ns) {
-    addToTime(simClock->seconds, simClock->nanoseconds, ns);
-}
-
-bool timeReached(unsigned int sec1, unsigned int nano1,
-                 unsigned int sec2, unsigned int nano2) {
-    if (sec1 > sec2) return true;
-    if (sec1 == sec2 && nano1 >= nano2) return true;
-    return false;
-}
 
 void cleanup() {
-    if (simClock != nullptr) {
-        shmdt(simClock);
-        simClock = nullptr;
-    }
-
-    if (shmId != -1) {
-        shmctl(shmId, IPC_RMID, nullptr);
-        shmId = -1;
-    }
-
     if (msgId != -1) {
         msgctl(msgId, IPC_RMID, nullptr);
-        msgId = -1;
-    }
-}
-
-void killChildren() {
-    for (int i = 0; i < PCB_SIZE; i++) {
-        if (processTable[i].occupied && processTable[i].pid > 0) {
-            kill(processTable[i].pid, SIGTERM);
-        }
-    }
-
-    while (waitpid(-1, nullptr, WNOHANG) > 0) {
     }
 }
 
 void signalHandler(int sig) {
-    cerr << "\nOSS: caught signal " << sig << ", cleaning up.\n";
-    killChildren();
     cleanup();
     exit(1);
 }
 
-void printUsage(const char* program) {
-    cout << "Usage: " << program
-         << " [-h] [-n proc] [-s simul] [-t timeLimitForChildren] "
-         << "[-i fractionOfSecondToLaunchChildren] [-f logfile]\n";
-}
+void incrementClock(SimClock& clock, unsigned int ns) {
+    clock.nanoseconds += ns;
 
-void parseArguments(int argc, char* argv[]) {
-    int opt;
-
-    while ((opt = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
-        switch (opt) {
-            case 'h':
-                printUsage(argv[0]);
-                exit(0);
-            case 'n':
-                totalChildren = atoi(optarg);
-                break;
-            case 's':
-                maxSimultaneous = atoi(optarg);
-                break;
-            case 't':
-                timeLimitForChildren = atof(optarg);
-                break;
-            case 'i':
-                launchInterval = atof(optarg);
-                break;
-            case 'f':
-                logFileName = optarg;
-                break;
-            default:
-                printUsage(argv[0]);
-                exit(1);
-        }
+    while (clock.nanoseconds >= 1000000000) {
+        clock.seconds++;
+        clock.nanoseconds -= 1000000000;
     }
-
-    if (totalChildren < 1) totalChildren = 1;
-    if (totalChildren > MAX_TOTAL_PROCESSES) totalChildren = MAX_TOTAL_PROCESSES;
-
-    if (maxSimultaneous < 1) maxSimultaneous = 1;
-    if (maxSimultaneous > PCB_SIZE) maxSimultaneous = PCB_SIZE;
 }
 
-void initTables() {
-    for (int i = 0; i < PCB_SIZE; i++) {
-        processTable[i].occupied = 0;
-        processTable[i].pid = 0;
-        processTable[i].localPid = i;
-        processTable[i].startSeconds = 0;
-        processTable[i].startNano = 0;
-        processTable[i].blocked = 0;
+void logBoth(ofstream& logFile, const string& message) {
+    cout << message << endl;
+    logFile << message << endl;
+}
+
+void initializePCB(PCB pcb[]) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pcb[i].occupied = 0;
+        pcb[i].pid = -1;
 
         for (int j = 0; j < NUM_PAGES; j++) {
-            processTable[i].pageTable[j].frame = -1;
-            processTable[i].pageTable[j].valid = 0;
+            pcb[i].pageTable[j].frame = -1;
         }
-    }
-
-    for (int i = 0; i < NUM_FRAMES; i++) {
-        frameTable[i].occupied = 0;
-        frameTable[i].dirtyBit = 0;
-        frameTable[i].processIndex = -1;
-        frameTable[i].pageNumber = -1;
     }
 }
 
-int getFreePCB() {
-    for (int i = 0; i < PCB_SIZE; i++) {
-        if (!processTable[i].occupied) {
+void initializeFrameTable(Frame frameTable[]) {
+    for (int i = 0; i < NUM_FRAMES; i++) {
+        frameTable[i].occupied = 0;
+        frameTable[i].process = -1;
+        frameTable[i].page = -1;
+        frameTable[i].dirty = 0;
+    }
+}
+
+int getOpenPCB(PCB pcb[]) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (pcb[i].occupied == 0) {
             return i;
         }
     }
@@ -230,287 +102,343 @@ int getFreePCB() {
     return -1;
 }
 
-void removeFromPCB(int index) {
-    processTable[index].occupied = 0;
-    processTable[index].pid = 0;
-    processTable[index].blocked = 0;
+int countActiveProcesses(PCB pcb[]) {
+    int count = 0;
+
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (pcb[i].occupied) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+int findFreeFrame(Frame frameTable[]) {
+    for (int i = 0; i < NUM_FRAMES; i++) {
+        if (frameTable[i].occupied == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+void freeProcessFrames(int processIndex, PCB pcb[], Frame frameTable[]) {
+    for (int i = 0; i < NUM_FRAMES; i++) {
+        if (frameTable[i].occupied && frameTable[i].process == processIndex) {
+            frameTable[i].occupied = 0;
+            frameTable[i].process = -1;
+            frameTable[i].page = -1;
+            frameTable[i].dirty = 0;
+        }
+    }
 
     for (int i = 0; i < NUM_PAGES; i++) {
-        processTable[index].pageTable[i].frame = -1;
-        processTable[index].pageTable[i].valid = 0;
+        pcb[processIndex].pageTable[i].frame = -1;
     }
 }
 
-void setNextLaunchTime(double interval) {
-    unsigned int ns = static_cast<unsigned int>(interval * BILLION);
-    nextLaunchSec = simClock->seconds;
-    nextLaunchNano = simClock->nanoseconds;
-    addToTime(nextLaunchSec, nextLaunchNano, ns);
-}
+void printMemoryLayout(ofstream& logFile, PCB pcb[], Frame frameTable[], SimClock clock) {
+    logBoth(logFile, "");
+    logBoth(logFile, "Current memory layout at time " +
+           to_string(clock.seconds) + ":" + to_string(clock.nanoseconds));
 
-bool timeToLaunch() {
-    return timeReached(simClock->seconds, simClock->nanoseconds,
-                       nextLaunchSec, nextLaunchNano);
-}
-
-void launchWorker(int index) {
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        perror("fork");
-        return;
-    }
-
-    if (pid == 0) {
-        string indexStr = to_string(index);
-        execl("./worker", "worker", indexStr.c_str(), (char*)nullptr);
-        perror("execl");
-        exit(1);
-    }
-
-    processTable[index].occupied = 1;
-    processTable[index].pid = pid;
-    processTable[index].localPid = index;
-    processTable[index].startSeconds = simClock->seconds;
-    processTable[index].startNano = simClock->nanoseconds;
-    processTable[index].blocked = 0;
-
-    for (int j = 0; j < NUM_PAGES; j++) {
-        processTable[index].pageTable[j].frame = -1;
-        processTable[index].pageTable[j].valid = 0;
-    }
-
-    readyQueue.push(index);
-
-    writeLog("OSS: Generating process P" + to_string(index) +
-             " PID " + to_string(pid) +
-             " at time " +
-             to_string(simClock->seconds) + ":" +
-             to_string(simClock->nanoseconds) + "\n");
-}
-
-void freeProcessFrames(int index) {
-    for (int i = 0; i < NUM_FRAMES; i++) {
-        if (frameTable[i].occupied && frameTable[i].processIndex == index) {
-            frameTable[i].occupied = 0;
-            frameTable[i].dirtyBit = 0;
-            frameTable[i].processIndex = -1;
-            frameTable[i].pageNumber = -1;
-        }
-    }
-}
-
-void printMemoryTables() {
-    writeLog("\nOSS: Current memory layout at time " +
-             to_string(simClock->seconds) + ":" +
-             to_string(simClock->nanoseconds) + "\n");
-
-    writeLog("Frame Table:\n");
-    writeLog("Frame  Occupied  Dirty  Process  Page\n");
+    logBoth(logFile, "Occupied DirtyBit Process Page");
 
     for (int i = 0; i < NUM_FRAMES; i++) {
-        ostringstream out;
-        out << setw(5) << i << "  "
-            << setw(8) << frameTable[i].occupied << "  "
-            << setw(5) << frameTable[i].dirtyBit << "  "
-            << setw(7) << frameTable[i].processIndex << "  "
-            << setw(4) << frameTable[i].pageNumber << "\n";
-        writeLog(out.str());
+        string occupied = frameTable[i].occupied ? "Yes" : "No";
+
+        logBoth(logFile,
+            "Frame " + to_string(i) + ": " +
+            occupied + " " +
+            to_string(frameTable[i].dirty) + " " +
+            to_string(frameTable[i].process) + " " +
+            to_string(frameTable[i].page)
+        );
     }
 
-    writeLog("Page Tables:\n");
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (pcb[i].occupied) {
+            string line = "P" + to_string(i) + " page table: [ ";
 
-    for (int i = 0; i < PCB_SIZE; i++) {
-        if (!processTable[i].occupied) continue;
+            for (int j = 0; j < NUM_PAGES; j++) {
+                line += to_string(pcb[i].pageTable[j].frame) + " ";
+            }
 
-        ostringstream out;
-        out << "P" << i << " page table: [ ";
-
-        for (int j = 0; j < NUM_PAGES; j++) {
-            out << processTable[i].pageTable[j].frame << " ";
+            line += "]";
+            logBoth(logFile, line);
         }
-
-        out << "]\n";
-        writeLog(out.str());
     }
 
-    writeLog("\n");
+    logBoth(logFile, "");
+}
+
+void sendMessageToWorker(pid_t pid, int index) {
+    Message msg;
+    msg.mtype = pid;       // worker waits on getpid()
+    msg.index = index;
+    msg.address = 0;
+    msg.isWrite = 0;
+    msg.terminate = 0;
+
+    if (msgsnd(msgId, &msg, sizeof(Message) - sizeof(long), 0) == -1) {
+        perror("oss msgsnd");
+    }
 }
 
 int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
-    signal(SIGALRM, signalHandler);
-    alarm(5);
 
-    parseArguments(argc, argv);
+    int totalChildren = 5;
+    int maxSimultaneous = 2;
+    int timeLimit = 3;
+    int launchInterval = 100000000;
+    string logFileName = "logfile.txt";
 
-    logFile.open(logFileName.c_str(), ios::out | ios::trunc);
+    int opt;
+
+    while ((opt = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
+        switch (opt) {
+            case 'h':
+                cout << "Usage: ./oss [-h] [-n proc] [-s simul] [-t timeLimit] [-i interval] [-f logfile]\n";
+                return 0;
+
+            case 'n':
+                totalChildren = atoi(optarg);
+                break;
+
+            case 's':
+                maxSimultaneous = atoi(optarg);
+                break;
+
+            case 't':
+                timeLimit = atoi(optarg);
+                break;
+
+            case 'i':
+                launchInterval = atoi(optarg);
+                break;
+
+            case 'f':
+                logFileName = optarg;
+                break;
+
+            default:
+                cerr << "Invalid option\n";
+                return 1;
+        }
+    }
+
+    ofstream logFile(logFileName);
+
     if (!logFile) {
-        cerr << "Failed to open log file.\n";
+        cerr << "Could not open log file\n";
         return 1;
     }
-
-    key_t shmKey = ftok(".", 65);
-    if (shmKey == -1) {
-        perror("ftok shm");
-        return 1;
-    }
-
-    shmId = shmget(shmKey, sizeof(SimClock), IPC_CREAT | 0666);
-    if (shmId == -1) {
-        perror("shmget");
-        return 1;
-    }
-
-    simClock = (SimClock*)shmat(shmId, nullptr, 0);
-    if (simClock == (void*)-1) {
-        perror("shmat");
-        simClock = nullptr;
-        cleanup();
-        return 1;
-    }
-
-    simClock->seconds = 0;
-    simClock->nanoseconds = 0;
 
     key_t msgKey = ftok(".", 75);
     if (msgKey == -1) {
-        perror("ftok msg");
-        cleanup();
+        perror("oss ftok");
         return 1;
     }
 
     msgId = msgget(msgKey, IPC_CREAT | 0666);
     if (msgId == -1) {
-        perror("msgget");
-        cleanup();
+        perror("oss msgget");
         return 1;
     }
 
-    initTables();
-    setNextLaunchTime(0.0);
+    PCB pcb[MAX_PROCESSES];
+    Frame frameTable[NUM_FRAMES];
+    SimClock simClock;
 
-    while (finishedTotal < totalChildren || runningNow > 0) {
-        while (runningNow < maxSimultaneous &&
-               launchedTotal < totalChildren &&
-               timeToLaunch()) {
+    initializePCB(pcb);
+    initializeFrameTable(frameTable);
 
-            int index = getFreePCB();
+    simClock.seconds = 0;
+    simClock.nanoseconds = 0;
 
-            if (index == -1) {
-                break;
-            }
+    int launched = 0;
 
-            launchWorker(index);
-            launchedTotal++;
-            runningNow++;
+    unsigned int nextLaunchSeconds = 0;
+    unsigned int nextLaunchNanoseconds = 0;
 
-            setNextLaunchTime(launchInterval);
-            advanceClock(DISPATCH_OVERHEAD);
+    unsigned int nextPrintSeconds = 0;
+    unsigned int nextPrintNanoseconds = 500000000;
+
+    while (launched < totalChildren || countActiveProcesses(pcb) > 0) {
+        incrementClock(simClock, 10000);
+
+        while (waitpid(-1, nullptr, WNOHANG) > 0) {
+            // worker termination is handled by terminate message
         }
 
-        if (!readyQueue.empty()) {
-            int index = readyQueue.front();
-            readyQueue.pop();
+        bool canLaunchNow =
+            simClock.seconds > nextLaunchSeconds ||
+            (simClock.seconds == nextLaunchSeconds &&
+             simClock.nanoseconds >= nextLaunchNanoseconds);
 
-            if (!processTable[index].occupied) {
+        if (launched < totalChildren &&
+            countActiveProcesses(pcb) < maxSimultaneous &&
+            canLaunchNow) {
+
+            int index = getOpenPCB(pcb);
+
+            if (index != -1) {
+                pid_t pid = fork();
+
+                if (pid == -1) {
+                    perror("fork");
+                    cleanup();
+                    return 1;
+                }
+
+                if (pid == 0) {
+                    execl("./worker", "./worker", to_string(index).c_str(), nullptr);
+                    perror("execl");
+                    exit(1);
+                }
+
+                pcb[index].occupied = 1;
+                pcb[index].pid = pid;
+
+                for (int i = 0; i < NUM_PAGES; i++) {
+                    pcb[index].pageTable[i].frame = -1;
+                }
+
+                logBoth(logFile,
+                    "oss: Launching P" + to_string(index) +
+                    " with pid " + to_string(pid) +
+                    " at time " + to_string(simClock.seconds) +
+                    ":" + to_string(simClock.nanoseconds)
+                );
+
+                sendMessageToWorker(pid, index);
+
+                launched++;
+
+                nextLaunchNanoseconds += launchInterval;
+
+                while (nextLaunchNanoseconds >= 1000000000) {
+                    nextLaunchSeconds++;
+                    nextLaunchNanoseconds -= 1000000000;
+                }
+            }
+        }
+
+        Message msg;
+
+        if (msgrcv(msgId, &msg, sizeof(Message) - sizeof(long), 1, IPC_NOWAIT) != -1) {
+            int processIndex = msg.index;
+
+            if (processIndex < 0 || processIndex >= MAX_PROCESSES || pcb[processIndex].occupied == 0) {
                 continue;
             }
 
-            pid_t childPid = processTable[index].pid;
+            if (msg.terminate) {
+                logBoth(logFile,
+                    "oss: P" + to_string(processIndex) +
+                    " terminating at time " +
+                    to_string(simClock.seconds) + ":" +
+                    to_string(simClock.nanoseconds)
+                );
 
-            Message dispatchMsg;
-            dispatchMsg.mtype = childPid;
-            dispatchMsg.index = index;
-            dispatchMsg.address = 0;
-            dispatchMsg.isWrite = 0;
-            dispatchMsg.terminate = 0;
+                freeProcessFrames(processIndex, pcb, frameTable);
 
-            writeLog("OSS: Dispatching P" + to_string(index) +
-                     " at time " +
-                     to_string(simClock->seconds) + ":" +
-                     to_string(simClock->nanoseconds) + "\n");
-
-            if (msgsnd(msgId, &dispatchMsg, sizeof(Message) - sizeof(long), 0) == -1) {
-                perror("msgsnd");
-                killChildren();
-                cleanup();
-                return 1;
-            }
-
-            Message replyMsg;
-
-            if (msgrcv(msgId, &replyMsg, sizeof(Message) - sizeof(long), 1, 0) == -1) {
-                perror("msgrcv");
-                killChildren();
-                cleanup();
-                return 1;
-            }
-
-            if (replyMsg.terminate) {
-                writeLog("OSS: Process P" + to_string(index) +
-                         " is terminating at time " +
-                         to_string(simClock->seconds) + ":" +
-                         to_string(simClock->nanoseconds) + "\n");
-
-                freeProcessFrames(index);
-                waitpid(childPid, nullptr, 0);
-                removeFromPCB(index);
-
-                runningNow--;
-                finishedTotal++;
+                pcb[processIndex].occupied = 0;
+                pcb[processIndex].pid = -1;
             } else {
-                totalRequests++;
+                int page = msg.address / PAGE_SIZE;
+                int frame = pcb[processIndex].pageTable[page].frame;
 
-                if (replyMsg.isWrite) {
-                    totalWrites++;
+                string action = msg.isWrite ? "write" : "read";
+
+                logBoth(logFile,
+                    "oss: P" + to_string(processIndex) +
+                    " requesting " + action +
+                    " of address " + to_string(msg.address) +
+                    " at time " + to_string(simClock.seconds) +
+                    ":" + to_string(simClock.nanoseconds)
+                );
+
+                if (frame == -1) {
+                    int freeFrame = findFreeFrame(frameTable);
+
+                    if (freeFrame == -1) {
+                        // Day 2 temporary replacement.
+                        // FIFO comes later.
+                        freeFrame = 0;
+
+                        int oldProcess = frameTable[freeFrame].process;
+                        int oldPage = frameTable[freeFrame].page;
+
+                        if (oldProcess != -1 && oldPage != -1) {
+                            pcb[oldProcess].pageTable[oldPage].frame = -1;
+                        }
+
+                        logBoth(logFile,
+                            "oss: No free frames, temporarily replacing frame 0"
+                        );
+                    }
+
+                    frameTable[freeFrame].occupied = 1;
+                    frameTable[freeFrame].process = processIndex;
+                    frameTable[freeFrame].page = page;
+                    frameTable[freeFrame].dirty = 0;
+
+                    pcb[processIndex].pageTable[page].frame = freeFrame;
+                    frame = freeFrame;
+
+                    logBoth(logFile,
+                        "oss: Address " + to_string(msg.address) +
+                        " is not in memory, loading page " +
+                        to_string(page) + " into frame " +
+                        to_string(frame)
+                    );
                 } else {
-                    totalReads++;
+                    logBoth(logFile,
+                        "oss: Address " + to_string(msg.address) +
+                        " is already in frame " + to_string(frame)
+                    );
                 }
 
-                int page = replyMsg.address / PAGE_SIZE;
+                if (msg.isWrite) {
+                    frameTable[frame].dirty = 1;
 
-                writeLog("OSS: P" + to_string(index) +
-                         " requesting " +
-                         (replyMsg.isWrite ? "write" : "read") +
-                         " of address " + to_string(replyMsg.address) +
-                         " page " + to_string(page) +
-                         " at time " +
-                         to_string(simClock->seconds) + ":" +
-                         to_string(simClock->nanoseconds) + "\n");
+                    logBoth(logFile,
+                        "oss: Dirty bit of frame " +
+                        to_string(frame) + " set"
+                    );
+                }
 
-               
-                // Just log request and put process back in ready queue.
-                readyQueue.push(index);
+                incrementClock(simClock, 100);
+
+                sendMessageToWorker(pcb[processIndex].pid, processIndex);
             }
+        }
 
-            advanceClock(CLOCK_INCREMENT);
-        } else {
-            advanceClock(IDLE_INCREMENT);
+        bool printNow =
+            simClock.seconds > nextPrintSeconds ||
+            (simClock.seconds == nextPrintSeconds &&
+             simClock.nanoseconds >= nextPrintNanoseconds);
+
+        if (printNow) {
+            printMemoryLayout(logFile, pcb, frameTable, simClock);
+
+            nextPrintNanoseconds += 500000000;
+
+            while (nextPrintNanoseconds >= 1000000000) {
+                nextPrintSeconds++;
+                nextPrintNanoseconds -= 1000000000;
+            }
         }
     }
 
-    while (waitpid(-1, nullptr, WNOHANG) > 0) {
-    }
-
-    ostringstream report;
-    report << "\nOSS: Final report\n";
-    report << "OSS: Total processes launched: " << launchedTotal << "\n";
-    report << "OSS: Total processes finished: " << finishedTotal << "\n";
-    report << "OSS: Total memory requests: " << totalRequests << "\n";
-    report << "OSS: Total reads: " << totalReads << "\n";
-    report << "OSS: Total writes: " << totalWrites << "\n";
-    report << "OSS: Total page faults: " << totalPageFaults << "\n";
-    report << "OSS: Simulation finished at time "
-           << simClock->seconds << ":" << simClock->nanoseconds << "\n";
-
-    writeLog(report.str());
-
-    printMemoryTables();
+    logBoth(logFile, "oss: All children finished. Cleaning up.");
 
     cleanup();
-    logFile.close();
 
     return 0;
 }
