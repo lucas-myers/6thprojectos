@@ -65,6 +65,39 @@ How to Run:
 
 22. Added temporary frame replacement behavior when memory is full. For now, it replaces frame 0. FIFO replacement will be added later.
 
+23. Added page fault detection. When oss receives a memory request, it checks whether the requested page is already loaded in that process page table.
+
+24. If the requested page is not currently in memory, oss logs it as a page fault.
+
+25. Added a blocked queue for processes waiting on page faults.
+
+26. When a page fault happens, oss places the process into the blocked queue instead of immediately sending a message back to the worker.
+
+27. Added a simulated 14ms disk delay for page fault handling.
+
+28. When the 14ms delay is complete, oss loads the requested page into a frame.
+
+29. After the page is loaded, oss unblocks the process and sends a message back to the worker so it can continue.
+
+30. Added a blocked flag inside the PCB to track whether a process is currently waiting on a page fault.
+
+31. Added output for blocked processes in the memory layout section.
+
+32. Added statistics tracking for:
+    - total memory requests
+    - total reads
+    - total writes
+    - total page faults
+    - page fault percentage
+
+33. Added final statistics output before oss cleans up and exits.
+
+34. Added logic to advance the simulated clock faster if all active processes are blocked. This prevents oss from sitting idle while every worker is waiting on a page fault.
+
+35. Added cleanup for blocked queue entries when a process terminates.
+
+36. The project still uses temporary frame replacement by replacing frame 0 when memory is full. FIFO replacement will be added later.
+
 AI Usage:
 
 Used: ChatGPT

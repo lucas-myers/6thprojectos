@@ -14,6 +14,7 @@ const int MAX_PROCESSES = 20;
 const int PAGE_SIZE = 1024;
 const int NUM_PAGES = 16;
 const int NUM_FRAMES = 64;
+const unsigned int DISK_DELAY = 14000000; // 14ms
 
 struct Message {
     long mtype;
@@ -29,6 +30,7 @@ struct PageTableEntry {
 
 struct PCB {
     int occupied;
+    int blocked;
     pid_t pid;
     PageTableEntry pageTable[NUM_PAGES];
 };
@@ -43,6 +45,16 @@ struct Frame {
 struct SimClock {
     unsigned int seconds;
     unsigned int nanoseconds;
+};
+
+struct BlockedRequest {
+    int occupied;
+    int processIndex;
+    int address;
+    int page;
+    int isWrite;
+    unsigned int unblockSeconds;
+    unsigned int unblockNanoseconds;
 };
 
 int msgId = -1;
@@ -67,6 +79,25 @@ void incrementClock(SimClock& clock, unsigned int ns) {
     }
 }
 
+void addTime(unsigned int currentSec,
+             unsigned int currentNano,
+             unsigned int addNano,
+             unsigned int& resultSec,
+             unsigned int& resultNano) {
+    resultSec = currentSec;
+    resultNano = currentNano + addNano;
+
+    while (resultNano >= 1000000000) {
+        resultSec++;
+        resultNano -= 1000000000;
+    }
+}
+
+bool timeReached(SimClock clock, unsigned int sec, unsigned int nano) {
+    return clock.seconds > sec ||
+           (clock.seconds == sec && clock.nanoseconds >= nano);
+}
+
 void logBoth(ofstream& logFile, const string& message) {
     cout << message << endl;
     logFile << message << endl;
@@ -75,6 +106,7 @@ void logBoth(ofstream& logFile, const string& message) {
 void initializePCB(PCB pcb[]) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         pcb[i].occupied = 0;
+        pcb[i].blocked = 0;
         pcb[i].pid = -1;
 
         for (int j = 0; j < NUM_PAGES; j++) {
@@ -89,6 +121,18 @@ void initializeFrameTable(Frame frameTable[]) {
         frameTable[i].process = -1;
         frameTable[i].page = -1;
         frameTable[i].dirty = 0;
+    }
+}
+
+void initializeBlockedQueue(BlockedRequest blockedQueue[]) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        blockedQueue[i].occupied = 0;
+        blockedQueue[i].processIndex = -1;
+        blockedQueue[i].address = 0;
+        blockedQueue[i].page = -1;
+        blockedQueue[i].isWrite = 0;
+        blockedQueue[i].unblockSeconds = 0;
+        blockedQueue[i].unblockNanoseconds = 0;
     }
 }
 
@@ -107,6 +151,18 @@ int countActiveProcesses(PCB pcb[]) {
 
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (pcb[i].occupied) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+int countUnblockedProcesses(PCB pcb[]) {
+    int count = 0;
+
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (pcb[i].occupied && pcb[i].blocked == 0) {
             count++;
         }
     }
@@ -139,7 +195,52 @@ void freeProcessFrames(int processIndex, PCB pcb[], Frame frameTable[]) {
     }
 }
 
-void printMemoryLayout(ofstream& logFile, PCB pcb[], Frame frameTable[], SimClock clock) {
+void removeBlockedRequestsForProcess(int processIndex, BlockedRequest blockedQueue[]) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (blockedQueue[i].occupied && blockedQueue[i].processIndex == processIndex) {
+            blockedQueue[i].occupied = 0;
+            blockedQueue[i].processIndex = -1;
+            blockedQueue[i].address = 0;
+            blockedQueue[i].page = -1;
+            blockedQueue[i].isWrite = 0;
+            blockedQueue[i].unblockSeconds = 0;
+            blockedQueue[i].unblockNanoseconds = 0;
+        }
+    }
+}
+
+int addToBlockedQueue(BlockedRequest blockedQueue[],
+                      int processIndex,
+                      int address,
+                      int page,
+                      int isWrite,
+                      SimClock clock) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (blockedQueue[i].occupied == 0) {
+            blockedQueue[i].occupied = 1;
+            blockedQueue[i].processIndex = processIndex;
+            blockedQueue[i].address = address;
+            blockedQueue[i].page = page;
+            blockedQueue[i].isWrite = isWrite;
+
+            addTime(clock.seconds,
+                    clock.nanoseconds,
+                    DISK_DELAY,
+                    blockedQueue[i].unblockSeconds,
+                    blockedQueue[i].unblockNanoseconds);
+
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+void printMemoryLayout(ofstream& logFile,
+                       PCB pcb[],
+                       Frame frameTable[],
+                       BlockedRequest blockedQueue[],
+                       SimClock clock) {
     logBoth(logFile, "");
     logBoth(logFile, "Current memory layout at time " +
            to_string(clock.seconds) + ":" + to_string(clock.nanoseconds));
@@ -171,6 +272,22 @@ void printMemoryLayout(ofstream& logFile, PCB pcb[], Frame frameTable[], SimCloc
         }
     }
 
+    string blockedLine = "Blocked processes: ";
+
+    bool anyBlocked = false;
+
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (blockedQueue[i].occupied) {
+            anyBlocked = true;
+            blockedLine += "P" + to_string(blockedQueue[i].processIndex) + " ";
+        }
+    }
+
+    if (!anyBlocked) {
+        blockedLine += "None";
+    }
+
+    logBoth(logFile, blockedLine);
     logBoth(logFile, "");
 }
 
@@ -187,6 +304,58 @@ void sendMessageToWorker(pid_t pid, int index) {
     }
 }
 
+void loadBlockedPage(BlockedRequest& request,
+                     PCB pcb[],
+                     Frame frameTable[],
+                     ofstream& logFile,
+                     SimClock clock) {
+    int processIndex = request.processIndex;
+    int page = request.page;
+
+    int freeFrame = findFreeFrame(frameTable);
+
+    if (freeFrame == -1) {
+        // Day 3 temporary replacement.
+        // FIFO replacement will be added later.
+        freeFrame = 0;
+
+        int oldProcess = frameTable[freeFrame].process;
+        int oldPage = frameTable[freeFrame].page;
+
+        if (oldProcess != -1 && oldPage != -1) {
+            pcb[oldProcess].pageTable[oldPage].frame = -1;
+        }
+
+        logBoth(logFile,
+            "oss: No free frames, temporarily replacing frame 0"
+        );
+    }
+
+    frameTable[freeFrame].occupied = 1;
+    frameTable[freeFrame].process = processIndex;
+    frameTable[freeFrame].page = page;
+    frameTable[freeFrame].dirty = 0;
+
+    pcb[processIndex].pageTable[page].frame = freeFrame;
+
+    logBoth(logFile,
+        "oss: Page fault complete for P" + to_string(processIndex) +
+        ". Loaded page " + to_string(page) +
+        " into frame " + to_string(freeFrame) +
+        " at time " + to_string(clock.seconds) +
+        ":" + to_string(clock.nanoseconds)
+    );
+
+    if (request.isWrite) {
+        frameTable[freeFrame].dirty = 1;
+
+        logBoth(logFile,
+            "oss: Dirty bit of frame " +
+            to_string(freeFrame) + " set"
+        );
+    }
+}
+
 int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
@@ -195,7 +364,7 @@ int main(int argc, char* argv[]) {
     int maxSimultaneous = 2;
     int timeLimit = 3;
     int launchInterval = 100000000;
-    string logFileName = "logfile.txt";
+    string logFileName = "oss.log";
 
     int opt;
 
@@ -252,15 +421,22 @@ int main(int argc, char* argv[]) {
 
     PCB pcb[MAX_PROCESSES];
     Frame frameTable[NUM_FRAMES];
+    BlockedRequest blockedQueue[MAX_PROCESSES];
     SimClock simClock;
 
     initializePCB(pcb);
     initializeFrameTable(frameTable);
+    initializeBlockedQueue(blockedQueue);
 
     simClock.seconds = 0;
     simClock.nanoseconds = 0;
 
     int launched = 0;
+
+    int totalRequests = 0;
+    int totalReads = 0;
+    int totalWrites = 0;
+    int totalPageFaults = 0;
 
     unsigned int nextLaunchSeconds = 0;
     unsigned int nextLaunchNanoseconds = 0;
@@ -272,7 +448,41 @@ int main(int argc, char* argv[]) {
         incrementClock(simClock, 10000);
 
         while (waitpid(-1, nullptr, WNOHANG) > 0) {
-            // worker termination is handled by terminate message
+            // Worker termination is handled when oss receives terminate message.
+        }
+
+        // Check blocked queue to see if any page fault has finished.
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            if (blockedQueue[i].occupied &&
+                timeReached(simClock,
+                            blockedQueue[i].unblockSeconds,
+                            blockedQueue[i].unblockNanoseconds)) {
+
+                int processIndex = blockedQueue[i].processIndex;
+
+                if (processIndex >= 0 &&
+                    processIndex < MAX_PROCESSES &&
+                    pcb[processIndex].occupied) {
+
+                    loadBlockedPage(blockedQueue[i],
+                                    pcb,
+                                    frameTable,
+                                    logFile,
+                                    simClock);
+
+                    pcb[processIndex].blocked = 0;
+
+                    sendMessageToWorker(pcb[processIndex].pid, processIndex);
+                }
+
+                blockedQueue[i].occupied = 0;
+                blockedQueue[i].processIndex = -1;
+                blockedQueue[i].address = 0;
+                blockedQueue[i].page = -1;
+                blockedQueue[i].isWrite = 0;
+                blockedQueue[i].unblockSeconds = 0;
+                blockedQueue[i].unblockNanoseconds = 0;
+            }
         }
 
         bool canLaunchNow =
@@ -302,6 +512,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 pcb[index].occupied = 1;
+                pcb[index].blocked = 0;
                 pcb[index].pid = pid;
 
                 for (int i = 0; i < NUM_PAGES; i++) {
@@ -333,7 +544,9 @@ int main(int argc, char* argv[]) {
         if (msgrcv(msgId, &msg, sizeof(Message) - sizeof(long), 1, IPC_NOWAIT) != -1) {
             int processIndex = msg.index;
 
-            if (processIndex < 0 || processIndex >= MAX_PROCESSES || pcb[processIndex].occupied == 0) {
+            if (processIndex < 0 ||
+                processIndex >= MAX_PROCESSES ||
+                pcb[processIndex].occupied == 0) {
                 continue;
             }
 
@@ -346,10 +559,20 @@ int main(int argc, char* argv[]) {
                 );
 
                 freeProcessFrames(processIndex, pcb, frameTable);
+                removeBlockedRequestsForProcess(processIndex, blockedQueue);
 
                 pcb[processIndex].occupied = 0;
+                pcb[processIndex].blocked = 0;
                 pcb[processIndex].pid = -1;
             } else {
+                totalRequests++;
+
+                if (msg.isWrite) {
+                    totalWrites++;
+                } else {
+                    totalReads++;
+                }
+
                 int page = msg.address / PAGE_SIZE;
                 int frame = pcb[processIndex].pageTable[page].frame;
 
@@ -364,45 +587,45 @@ int main(int argc, char* argv[]) {
                 );
 
                 if (frame == -1) {
-                    int freeFrame = findFreeFrame(frameTable);
+                    totalPageFaults++;
 
-                    if (freeFrame == -1) {
-                        // Day 2 temporary replacement.
-                        // FIFO comes later.
-                        freeFrame = 0;
+                    logBoth(logFile,
+                        "oss: Address " + to_string(msg.address) +
+                        " is not in memory, page fault"
+                    );
 
-                        int oldProcess = frameTable[freeFrame].process;
-                        int oldPage = frameTable[freeFrame].page;
+                    int blockedIndex = addToBlockedQueue(blockedQueue,
+                                                         processIndex,
+                                                         msg.address,
+                                                         page,
+                                                         msg.isWrite,
+                                                         simClock);
 
-                        if (oldProcess != -1 && oldPage != -1) {
-                            pcb[oldProcess].pageTable[oldPage].frame = -1;
-                        }
+                    if (blockedIndex != -1) {
+                        pcb[processIndex].blocked = 1;
 
                         logBoth(logFile,
-                            "oss: No free frames, temporarily replacing frame 0"
+                            "oss: P" + to_string(processIndex) +
+                            " blocked until time " +
+                            to_string(blockedQueue[blockedIndex].unblockSeconds) +
+                            ":" +
+                            to_string(blockedQueue[blockedIndex].unblockNanoseconds)
+                        );
+                    } else {
+                        logBoth(logFile,
+                            "oss: ERROR blocked queue is full"
                         );
                     }
 
-                    frameTable[freeFrame].occupied = 1;
-                    frameTable[freeFrame].process = processIndex;
-                    frameTable[freeFrame].page = page;
-                    frameTable[freeFrame].dirty = 0;
-
-                    pcb[processIndex].pageTable[page].frame = freeFrame;
-                    frame = freeFrame;
-
-                    logBoth(logFile,
-                        "oss: Address " + to_string(msg.address) +
-                        " is not in memory, loading page " +
-                        to_string(page) + " into frame " +
-                        to_string(frame)
-                    );
-                } else {
-                    logBoth(logFile,
-                        "oss: Address " + to_string(msg.address) +
-                        " is already in frame " + to_string(frame)
-                    );
+                    // Do NOT send message back yet.
+                    // Worker stays blocked on msgrcv until page fault completes.
+                    continue;
                 }
+
+                logBoth(logFile,
+                    "oss: Address " + to_string(msg.address) +
+                    " is already in frame " + to_string(frame)
+                );
 
                 if (msg.isWrite) {
                     frameTable[frame].dirty = 1;
@@ -419,13 +642,19 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // If every active process is blocked, move clock forward faster.
+        // This prevents oss from spinning forever while all workers wait.
+        if (countActiveProcesses(pcb) > 0 && countUnblockedProcesses(pcb) == 0) {
+            incrementClock(simClock, 1000000);
+        }
+
         bool printNow =
             simClock.seconds > nextPrintSeconds ||
             (simClock.seconds == nextPrintSeconds &&
              simClock.nanoseconds >= nextPrintNanoseconds);
 
         if (printNow) {
-            printMemoryLayout(logFile, pcb, frameTable, simClock);
+            printMemoryLayout(logFile, pcb, frameTable, blockedQueue, simClock);
 
             nextPrintNanoseconds += 500000000;
 
@@ -436,6 +665,23 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    logBoth(logFile, "");
+    logBoth(logFile, "Statistics:");
+    logBoth(logFile, "Total memory requests: " + to_string(totalRequests));
+    logBoth(logFile, "Total reads: " + to_string(totalReads));
+    logBoth(logFile, "Total writes: " + to_string(totalWrites));
+    logBoth(logFile, "Total page faults: " + to_string(totalPageFaults));
+
+    double pageFaultPercent = 0.0;
+
+    if (totalRequests > 0) {
+        pageFaultPercent = (static_cast<double>(totalPageFaults) /
+                            static_cast<double>(totalRequests)) * 100.0;
+    }
+
+    logBoth(logFile, "Page fault percentage: " + to_string(pageFaultPercent) + "%");
+
+    logBoth(logFile, "");
     logBoth(logFile, "oss: All children finished. Cleaning up.");
 
     cleanup();
