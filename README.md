@@ -96,7 +96,39 @@ How to Run:
 
 35. Added cleanup for blocked queue entries when a process terminates.
 
-36. The project still uses temporary frame replacement by replacing frame 0 when memory is full. FIFO replacement will be added later.
+36. 36. Completed FIFO page replacement when memory is full.
+
+37. The temporary frame replacement behavior was replaced with FIFO page replacement.
+
+38. A FIFO queue was added to keep track of the order that frames are loaded into memory.
+
+39. When memory is full and a page fault occurs, oss now selects the oldest loaded frame from the FIFO queue for replacement.
+
+40. Before a frame is replaced, oss clears the old process page table entry so that the process no longer points to that frame.
+
+41. When a new page is loaded into memory, the frame is added back into the FIFO queue.
+
+42. Frame generation tracking was added so old FIFO queue entries can be ignored if a frame was already freed or reused.
+
+43. Page replacement logging was completed so oss records when page faults occur, when frames are cleared, which process page is swapped out, and which new page is swapped in.
+
+44. Dirty bit replacement behavior was completed so dirty frames add extra simulated time when they are selected for replacement.
+
+45. The blocked queue handling was completed so processes wait during page faults and continue after the simulated disk delay finishes.
+
+46. Memory cleanup was completed so when a process terminates, all frames owned by that process are released and the page table is reset.
+
+47. Final statistics output was completed to show total memory references, total reads, total writes, total page faults, page fault percentage, and effective memory access time.
+
+48. Signal and resource cleanup were completed so shared memory, message queues, and child processes are cleaned up when oss exits.
+
+49. The project was tested using make clean, make, and ./oss -n 5 -s 2 -t 3 -i 0.5 -f oss.log.
+
+50. The log file was checked to confirm that memory requests, page faults, blocked processes, frame table output, page table output, FIFO replacement, dirty bit behavior, and final statistics were being recorded.
+
+51. The worker output was kept separate from the log file so only oss writes to the screen and the log file.
+
+52. The project now meets the main Assignment 6 memory management requirements, including page tables, frame table, dirty bits, page faults, blocked I/O delay, FIFO page replacement, memory layout output, final statistics, and cleanup.
 
 AI Usage:
 
