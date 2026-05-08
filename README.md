@@ -130,7 +130,27 @@ How to Run:
 
 52. The project now meets the main Assignment 6 memory management requirements, including page tables, frame table, dirty bits, page faults, blocked I/O delay, FIFO page replacement, memory layout output, final statistics, and cleanup.
 
-AI Usage:
-
 Used: ChatGPT
 
+How do I convert my previous resource management project into a memory management project while keeping the same oss/worker message queue structure?
+How should I design the PCB, page table, and frame table structures for this assignment?
+
+How do I implement FIFO page replacement using a queue of frames?
+
+How should oss handle a page fault when there are no empty frames available?
+
+How do I update both the victim process’s page table and the new process’s page table during a page replacement?
+
+How should dirty bits affect the simulated clock when a frame is replaced?
+
+How do I simulate blocking a process during disk I/O after a page fault?
+
+How do I correctly unblock a process after its page fault delay has completed?
+
+How should frames be released when a worker process terminates?
+
+How do I calculate and display final memory statistics such as total references, reads, writes, page faults, page fault percentage, and effective memory access time?
+
+How can I test that FIFO replacement, dirty bit handling, blocked queue behavior, and cleanup are working correctly?
+
+- AI has helped with breaking down the requirements into smaller ibts and helped understand how I would convert my older project into a memory managment project. It expalined how the FIFO queue, pague faults, dirty bits , and the blocked queue should work togehter. I also used it to think through the testing and see what I could have missed. The AI was a good guide for understanding and organizing. 
