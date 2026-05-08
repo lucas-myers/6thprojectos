@@ -1,4 +1,3 @@
-
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -27,7 +26,7 @@ const unsigned int BILLION = 1000000000;
 const unsigned int MEMORY_ACCESS_TIME = 100;
 const unsigned int DISK_TIME = 14000000;
 const unsigned int DIRTY_EXTRA_TIME = 14000000;
-const unsigned int LOOP_INCREMENT = 10000;
+const unsigned int LOOP_INCREMENT = 10000000;
 
 struct SimClock {
     unsigned int seconds;
@@ -173,18 +172,13 @@ void printHelp() {
          << "[-i fractionOfSecondToLaunchChildren] [-f logfile]\n";
 }
 
-int findOpenProcessSlot() {
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        if (!processTable[i].occupied) {
-            return i;
-        }
+void sendMessageToWorker(int index) {
+    if (index < 0 || index >= MAX_PROCESSES) {
+        return;
     }
 
-    return -1;
-}
-
-void sendMessageToWorker(int index) {
-    if (!processTable[index].occupied || processTable[index].blocked) {
+    if (!processTable[index].occupied || processTable[index].blocked ||
+        processTable[index].messageOutstanding) {
         return;
     }
 
@@ -351,6 +345,12 @@ void printMemoryLayout() {
 }
 
 void terminateProcess(int index) {
+    if (index < 0 || index >= MAX_PROCESSES || !processTable[index].occupied) {
+        return;
+    }
+
+    pid_t childPid = processTable[index].pid;
+
     output("oss: P" + to_string(index) +
            " terminating at time " +
            to_string(simClock->seconds) + ":" +
@@ -362,13 +362,31 @@ void terminateProcess(int index) {
            ", page faults: " +
            to_string(processTable[index].pageFaults) + "\n");
 
+    if (processTable[index].memoryReferences > 0) {
+        unsigned long long totalNano =
+            static_cast<unsigned long long>(simClock->seconds) * BILLION +
+            simClock->nanoseconds;
+
+        double processEffectiveAccessTime =
+            static_cast<double>(totalNano) /
+            static_cast<double>(processTable[index].memoryReferences);
+
+        output("oss: P" + to_string(index) +
+               " effective memory access time: " +
+               to_string(processEffectiveAccessTime) +
+               " nanoseconds\n");
+    }
+
     clearProcessMemory(index);
 
-    int status;
-    waitpid(processTable[index].pid, &status, 0);
-
     processTable[index] = PCB();
-    activeChildren--;
+
+    if (activeChildren > 0) {
+        activeChildren--;
+    }
+
+    int status;
+    waitpid(childPid, &status, 0);
 }
 
 void handleMemoryRequest(const Message& reply) {
@@ -474,7 +492,7 @@ void handleBlockedQueue() {
 
         int index = request.processIndex;
 
-        if (!processTable[index].occupied) {
+        if (index < 0 || index >= MAX_PROCESSES || !processTable[index].occupied) {
             continue;
         }
 
@@ -525,9 +543,18 @@ void advanceClockToNextBlockedRequest() {
 }
 
 void launchChild(int timeLimitForChildren) {
-    int index = findOpenProcessSlot();
+    // Important fix:
+    // Use totalLaunched as the PCB/process number so a run like -n 2 -s 1
+    // creates P0 first and P1 second instead of reusing P0 after it exits.
+    int index = totalLaunched;
 
-    if (index == -1) {
+    if (index < 0 || index >= MAX_PROCESSES) {
+        output("oss: Maximum process table size reached. Cannot launch more children.\n");
+        return;
+    }
+
+    if (processTable[index].occupied) {
+        output("oss: ERROR - selected process slot is already occupied.\n");
         return;
     }
 
@@ -539,10 +566,13 @@ void launchChild(int timeLimitForChildren) {
     }
 
     if (pid == 0) {
+        string indexArg = to_string(index);
+        string timeArg = to_string(timeLimitForChildren);
+
         execl("./worker",
               "worker",
-              to_string(index).c_str(),
-              to_string(timeLimitForChildren).c_str(),
+              indexArg.c_str(),
+              timeArg.c_str(),
               nullptr);
 
         perror("oss execl");
@@ -635,8 +665,11 @@ void cleanup() {
         if (processTable[i].occupied && processTable[i].pid > 0) {
             kill(processTable[i].pid, SIGTERM);
             waitpid(processTable[i].pid, nullptr, 0);
+            processTable[i] = PCB();
         }
     }
+
+    activeChildren = 0;
 
     if (simClock != nullptr) {
         shmdt(simClock);
@@ -693,8 +726,28 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (totalToLaunch < 1) {
+        totalToLaunch = 1;
+    }
+
+    if (totalToLaunch > MAX_PROCESSES) {
+        totalToLaunch = MAX_PROCESSES;
+    }
+
+    if (maxSimultaneous < 1) {
+        maxSimultaneous = 1;
+    }
+
     if (maxSimultaneous > MAX_PROCESSES) {
         maxSimultaneous = MAX_PROCESSES;
+    }
+
+    if (timeLimitForChildren < 1) {
+        timeLimitForChildren = 1;
+    }
+
+    if (launchInterval < 0.0) {
+        launchInterval = 0.0;
     }
 
     signal(SIGINT, signalHandler);
@@ -717,7 +770,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    msgId = msgget(msgKey, IPC_CREAT | 0666);
+    // Remove an old queue if one was left behind from a previous run.
+    int oldMsgId = msgget(msgKey, 0666);
+    if (oldMsgId != -1) {
+        msgctl(oldMsgId, IPC_RMID, nullptr);
+    }
+
+    msgId = msgget(msgKey, IPC_CREAT | IPC_EXCL | 0666);
 
     if (msgId == -1) {
         perror("oss msgget");
@@ -733,7 +792,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    shmId = shmget(shmKey, sizeof(SimClock), IPC_CREAT | 0666);
+    // Remove old shared memory if one was left behind from a previous run.
+    int oldShmId = shmget(shmKey, sizeof(SimClock), 0666);
+    if (oldShmId != -1) {
+        shmctl(oldShmId, IPC_RMID, nullptr);
+    }
+
+    shmId = shmget(shmKey, sizeof(SimClock), IPC_CREAT | IPC_EXCL | 0666);
 
     if (shmId == -1) {
         perror("oss shmget");

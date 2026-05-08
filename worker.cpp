@@ -1,4 +1,3 @@
-
 #include <iostream>
 #include <cstdlib>
 #include <ctime>
@@ -104,10 +103,7 @@ int main(int argc, char* argv[]) {
     while (true) {
         Message msg;
 
-        /*
-            Wait until oss sends this process a message.
-            oss sends using mtype = child pid.
-        */
+        // Wait until oss sends this worker a turn.
         if (msgrcv(msgId,
                    &msg,
                    sizeof(Message) - sizeof(long),
@@ -125,9 +121,6 @@ int main(int argc, char* argv[]) {
         reply.address = 0;
         reply.isWrite = 0;
 
-        /*
-            Check if this worker's simulated lifetime is over.
-        */
         if (timeReached(simClock->seconds,
                         simClock->nanoseconds,
                         endSec,
@@ -139,10 +132,7 @@ int main(int argc, char* argv[]) {
 
             reply.address = page * PAGE_SIZE + offset;
 
-            /*
-                Bias toward reads.
-                About 70 percent reads and 30 percent writes.
-            */
+            // Bias toward reads: about 70% reads, 30% writes.
             reply.isWrite = (rand() % 100 < 30) ? 1 : 0;
         }
 
