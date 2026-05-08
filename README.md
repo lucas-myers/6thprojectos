@@ -128,8 +128,6 @@ How to Run:
 
 51. The worker output was kept separate from the log file so only oss writes to the screen and the log file.
 
-52. The project now meets the main Assignment 6 memory management requirements, including page tables, frame table, dirty bits, page faults, blocked I/O delay, FIFO page replacement, memory layout output, final statistics, and cleanup.
-
 Used: ChatGPT
 
 How do I convert my previous resource management project into a memory management project while keeping the same oss/worker message queue structure?
